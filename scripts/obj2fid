@@ -1,0 +1,134 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2014, Lawrence Livermore National Security, LLC.
+# Produced at the Lawrence Livermore National Laboratory.
+# Written by Christopher J. Morrone <morrone2@llnl.gov>
+# LLNL-CODE-468512
+#
+# This file is part of lustre-tools-llnl.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License (as published by the
+# Free Software Foundation) version 2, dated June 1991.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the IMPLIED WARRANTY OF
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# terms and conditions of the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+# Given a zfs dataset for a Lustre OST and the object number of a file
+# in that dataset, this script will call zdb to retreive the Lustre FID
+# and print it out in standard Lustre FID format.  Alternatively, a
+# mountpoint and Lustre object number may be given, in which case
+# getfattr will be called to retrieve the FID.  The latter method is
+# faster.
+
+import sys
+import subprocess
+import optparse
+
+def from_bytes(b):
+    return sum(b[i] << i*8 for i in range(len(b)))
+
+def fid_bytes_from_getfattr(mount_point, lustre_objid):
+    path = "%s/O/0/d%d/%d" % (mount_point, lustre_objid % 32, lustre_objid)
+
+    p = subprocess.Popen(["getfattr", "-e", "hex", "-n", "trusted.fid", path],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    pout, perr = p.communicate()
+
+    for line in pout.split('\n'):
+        part = line.split('=')
+
+        if not part or part[0] != 'trusted.fid':
+            continue
+
+        fid = part[1]
+        fid = fid[2:] # strip off '0x'
+        b = bytearray()
+
+        while len(fid) > 0:
+            val = fid[0:2]
+            fid = fid[2:]
+            b.append(int(val, 16))
+
+        return b
+
+def fid_bytes_from_zdb(dataset, zfs_inode):
+    p = subprocess.Popen(["zdb", "-vvv", dataset, "%d" % zfs_inode],
+                          stdout=subprocess.PIPE)
+    pout, perr = p.communicate()
+
+    for line in pout.split('\n'):
+        part = line.split()
+
+        if not part or part[0] != 'trusted.fid':
+            continue
+
+        fid = part[2]
+        b = bytearray()
+
+        while len(fid) > 0:
+            val = fid[0]
+            fid = fid[1:]
+            if val == '\\':
+                val = fid[0:3]
+                fid = fid[3:]
+                b.append(int(val, 8))
+            else:
+                b.append(ord(val))
+
+        return b
+
+def main():
+    usage = "usage: %prog [options]"
+    parser = optparse.OptionParser(usage)
+
+    parser.add_option("-i", "--inode",
+                      help="ZFS inode number to get FID of (requires -d)",
+                      default=None, type="int", dest="inode")
+
+    parser.add_option("-l", "--lustre-objid",
+                      help="Lustre object ID to get FID of (requires -m)",
+                      default=None, type="int", dest="objid")
+
+    parser.add_option("-m", "--mount-point", help="mountpount of OST dataset",
+                      default=None, type="string", dest="ost_mount_point")
+
+    parser.add_option("-d", "--dataset", help="name of OST ZFS dataset",
+                      default=None, type="string", dest="ost_dataset")
+
+    (options, _) = parser.parse_args()
+
+    if options.inode and options.objid:
+        parser.error('Only one of -i or -l may be specified.')
+
+    if not options.inode and not options.objid:
+        parser.error('Either -i or -l are required.')
+
+    if options.inode and not options.ost_dataset:
+        parser.error('The -i option requires the -d option.')
+
+    if options.objid and not options.ost_mount_point:
+        parser.error('The -l option requires the -m option.')
+
+    if options.inode:
+        b = fid_bytes_from_zdb(options.ost_dataset, options.inode)
+    else:
+        b = fid_bytes_from_getfattr(options.ost_mount_point, options.objid)
+
+    if not b:
+        return
+
+    print '[' \
+        + hex(from_bytes(b[0:8])) \
+        + ':' \
+        + hex(from_bytes(b[8:12])) \
+        + ':0x0]'
+
+if __name__ == '__main__':
+      sys.exit(main())
